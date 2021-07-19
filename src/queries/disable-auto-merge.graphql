@@ -1,0 +1,14 @@
+mutation DisableAutoMerge($pullRequestId: ID!) {
+  disablePullRequestAutoMerge(input: {
+    pullRequestId: $pullRequestId,
+  }) {
+    pullRequest {
+      autoMergeRequest {
+        enabledAt
+        enabledBy {
+          login
+        }
+      }
+    }
+  }
+}

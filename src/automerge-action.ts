@@ -2,12 +2,16 @@ import * as core from '@actions/core'
 import * as github from '@actions/github'
 import { isPresent } from 'ts-is-present'
 
+import {
+  EnableAutoMerge,
+  EnableAutoMergeMutation,
+  DisableAutoMerge,
+  DisableAutoMergeMutation,
+} from './generated/graphql'
+
 import { Input } from './input'
 import {
-  isApprovedByAllowedAuthor,
   isAuthorAllowed,
-  commitHasMinimumApprovals,
-  passedRequiredStatusChecks,
   pullRequestsForWorkflowRun,
   pullRequestsForCheckSuite,
   requiredStatusChecksForBranch,
@@ -21,31 +25,6 @@ export class AutomergeAction {
   constructor(octokit: Octokit, input: Input) {
     this.octokit = octokit
     this.input = input
-  }
-
-  async automergePullRequests(numbers: number[]): Promise<void> {
-    const maxTries = 5
-    const retries = maxTries - 1
-
-    const queue = numbers.map(number => ({ number, tries: 0 }))
-
-    let arg
-    while ((arg = queue.shift())) {
-      const { number, tries } = arg
-
-      if (tries > 0) {
-        await new Promise(r => setTimeout(r, 2 ** tries * 1000))
-      }
-
-      const triesLeft = retries - tries
-      const retry = await this.automergePullRequest(number, triesLeft)
-
-      if (retry) {
-        queue.push({ number, tries: tries + 1 })
-      }
-
-      core.info('')
-    }
   }
 
   async determineMergeMethod(): Promise<MergeMethod> {
@@ -66,7 +45,39 @@ export class AutomergeAction {
     }
   }
 
-  async automergePullRequest(number: number, triesLeft: number): Promise<boolean> {
+  async disableAutoMerge(pullRequest: PullRequest): Promise<DisableAutoMergeMutation> {
+    core.info(`Disabling auto-merge for pull request ${pullRequest.number}.`)
+
+    // We need to get the source code of the query since the `@octokit/graphql`
+    // API doesn't (yet) support passing a `DocumentNode` object.
+    const query = DisableAutoMerge.loc!.source!.body
+
+    return await this.octokit.graphql({
+      query,
+      pullRequestId: pullRequest.node_id,
+    })
+  }
+
+  async enableAutoMerge(
+    pullRequest: PullRequest,
+    commitTitle: string | undefined,
+    commitMessage: string | undefined,
+    mergeMethod: MergeMethod
+  ): Promise<EnableAutoMergeMutation> {
+    // We need to get the source code of the query since the `@octokit/graphql`
+    // API doesn't (yet) support passing a `DocumentNode` object.
+    const query = EnableAutoMerge.loc!.source!.body
+
+    return await this.octokit.graphql({
+      query,
+      pullRequestId: pullRequest.node_id,
+      commitHeadline: commitTitle,
+      commitBody: commitMessage,
+      mergeMethod: mergeMethod?.toUpperCase(),
+    })
+  }
+
+  async autoMergePullRequest(number: number): Promise<void> {
     core.info(`Evaluating mergeability for pull request ${number}:`)
 
     const pullRequest = (
@@ -78,12 +89,13 @@ export class AutomergeAction {
 
     if (pullRequest.merged === true) {
       core.info(`Pull request ${number} is already merged.`)
-      return false
+      return
     }
 
     if (pullRequest.state === 'closed') {
       core.info(`Pull request ${number} is closed.`)
-      return false
+      await this.disableAutoMerge(pullRequest)
+      return
     }
 
     const authorAssociations = this.input.pullRequestAuthorAssociations
@@ -92,7 +104,8 @@ export class AutomergeAction {
         `Author of pull request ${number} is ${pullRequest.author_association} but must be one of the following: ` +
           `${authorAssociations.join(', ')}`
       )
-      return false
+      await this.disableAutoMerge(pullRequest)
+      return
     }
 
     const baseBranch = pullRequest.base.ref
@@ -101,17 +114,8 @@ export class AutomergeAction {
     // Only auto-merge if there is at least one required status check.
     if (requiredStatusChecks.length < 1) {
       core.info(`Base branch '${baseBranch}' of pull request ${number} is not sufficiently protected.`)
-      return false
-    }
-
-    if (!(await passedRequiredStatusChecks(this.octokit, pullRequest, requiredStatusChecks))) {
-      core.info(`Required status checks for pull request ${number} are not successful.`)
-      return false
-    }
-
-    if (!(await this.isPullRequestApproved(pullRequest))) {
-      core.info(`Pull request ${number} is not approved.`)
-      return false
+      await this.disableAutoMerge(pullRequest)
+      return
     }
 
     const labels = pullRequest.labels.map(({ name }) => name).filter(isPresent)
@@ -121,7 +125,8 @@ export class AutomergeAction {
         `Pull request ${number} is not mergeable because the following labels are applied: ` +
           `${doNotMergeLabels.join(', ')}`
       )
-      return false
+      await this.disableAutoMerge(pullRequest)
+      return
     }
 
     for (const requiredLabel of this.input.requiredLabels) {
@@ -129,7 +134,8 @@ export class AutomergeAction {
         core.info(
           `Pull request ${number} is not mergeable because it does not have the required label: ${requiredLabel}`
         )
-        return false
+        await this.disableAutoMerge(pullRequest)
+        return
       }
     }
 
@@ -138,16 +144,13 @@ export class AutomergeAction {
     switch (mergeableState) {
       case 'draft': {
         core.info(`Pull request ${number} is not mergeable because it is a draft.`)
-        return false
+        await this.disableAutoMerge(pullRequest)
+        return
+
+        break
       }
-      case 'dirty': {
-        core.info(`Pull request ${number} is not mergeable because it is dirty.`)
-        return false
-      }
-      case 'blocked': {
-        core.info(`Merging is blocked for pull request ${number}.`)
-        return false
-      }
+      case 'dirty':
+      case 'blocked':
       case 'clean':
       case 'has_hooks':
       case 'unknown':
@@ -163,72 +166,43 @@ export class AutomergeAction {
         const titleMessage = useTitle ? ` with title '${commitTitle}'` : undefined
 
         if (this.input.dryRun) {
-          core.info(`Would try merging pull request ${number}${titleMessage}.`)
-          return false
+          core.info(`Would try enabling auto-merge for pull request ${number}${titleMessage}.`)
+          return
         }
 
         try {
-          core.info(`Merging pull request ${number}${titleMessage}:`)
-          await this.octokit.pulls.merge({
-            ...github.context.repo,
-            pull_number: number,
-            sha: pullRequest.head.sha,
-            merge_method: mergeMethod,
-            commit_title: commitTitle,
-            commit_message: commitMessage,
-          })
-
-          core.info(`Successfully merged pull request ${number}.`)
-
-          return false
-        } catch (error) {
-          const message = `Failed to merge pull request ${number} (${triesLeft} tries left): ${error.message}`
-          if (triesLeft === 0) {
-            core.setFailed(message)
-            return false
-          } else {
-            core.error(message)
-            return true
+          // If auto-merge is already enabled with the same merge method, disable it
+          // in order to update the commit title and message.
+          const { auto_merge: autoMerge } = pullRequest
+          if (autoMerge && commitTitle && commitMessage && autoMerge.merge_method == mergeMethod) {
+            if (autoMerge.commit_title != commitTitle || autoMerge.commit_message != commitMessage) {
+              await this.disableAutoMerge(pullRequest)
+            }
           }
+
+          core.info(`Enabling auto-merge for pull request ${number}${titleMessage}:`)
+          const result = await this.enableAutoMerge(pullRequest, commitTitle, commitMessage, mergeMethod)
+
+          if (result.enablePullRequestAutoMerge?.pullRequest?.autoMergeRequest?.enabledAt) {
+            core.info(`Successfully enabled auto-merge for pull request ${number}.`)
+          } else {
+            core.setFailed(`Enabling auto-merge for pull request ${number} failed.`)
+          }
+          return
+        } catch (error) {
+          const message = `Failed to enable auto-merge for pull request ${number}: ${error.message}`
+          core.setFailed(message)
+          return
         }
+
+        break
       }
       default: {
-        core.warning(`Unknown state for pull request ${number}: '${mergeableState}'`)
-        return false
+        core.setFailed(`Unknown state for pull request ${number}: '${mergeableState}'`)
+        return
+
+        break
       }
-    }
-  }
-
-  async isPullRequestApproved(pullRequest: PullRequest): Promise<boolean> {
-    const reviews = (
-      await this.octokit.pulls.listReviews({
-        ...github.context.repo,
-        pull_number: pullRequest.number,
-        per_page: 100,
-      })
-    ).data
-
-    if (reviews.length === 100) {
-      core.setFailed('Handling pull requests with more than 100 reviews is not implemented.')
-      return false
-    }
-
-    const commit = pullRequest.head.sha
-    const minimumApprovals = 1
-    return commitHasMinimumApprovals(reviews, this.input.reviewAuthorAssociations, commit, minimumApprovals)
-  }
-
-  async handlePullRequestReview(): Promise<void> {
-    core.debug('handlePullRequestReview()')
-
-    const { action, review, pull_request: pullRequest } = github.context.payload
-
-    if (!action || !review || !pullRequest) {
-      return
-    }
-
-    if (action === 'submitted' && isApprovedByAllowedAuthor(review, this.input.reviewAuthorAssociations)) {
-      await this.automergePullRequests([pullRequest.number])
     }
   }
 
@@ -241,13 +215,7 @@ export class AutomergeAction {
       return
     }
 
-    if (
-      action === 'ready_for_review' ||
-      (action === 'labeled' && this.input.requiredLabels.includes(label.name)) ||
-      (action === 'unlabeled' && this.input.isDoNotMergeLabel(label.name))
-    ) {
-      await this.automergePullRequests([pullRequest.number])
-    }
+    await this.autoMergePullRequest(pullRequest.number)
   }
 
   async handleSchedule(): Promise<void> {
@@ -268,51 +236,8 @@ export class AutomergeAction {
       return
     }
 
-    await this.automergePullRequests(pullRequests.map(({ number }) => number))
-  }
-
-  async handleCheckSuite(): Promise<void> {
-    core.debug('handleCheckSuite()')
-
-    const { action, check_suite: checkSuite } = github.context.payload
-
-    if (!action || !checkSuite) {
-      return
+    for (const pullRequest of pullRequests) {
+      await this.autoMergePullRequest(pullRequest.number)
     }
-
-    if (checkSuite.conclusion !== 'success') {
-      core.info(
-        `Conclusion for check suite ${checkSuite.id} is ${checkSuite.conclusion}, not attempting to merge.`
-      )
-      return
-    }
-
-    const pullRequests = await pullRequestsForCheckSuite(this.octokit, checkSuite)
-
-    if (pullRequests.length === 0) {
-      core.info(`No open pull requests found for check suite ${checkSuite.id}.`)
-      return
-    }
-
-    await this.automergePullRequests(pullRequests)
-  }
-
-  async handleWorkflowRun(): Promise<void> {
-    core.debug('handleWorkflowRun()')
-
-    const { action, workflow_run: workflowRun } = github.context.payload
-
-    if (!action || !workflowRun) {
-      return
-    }
-
-    const pullRequests = await pullRequestsForWorkflowRun(this.octokit, workflowRun)
-
-    if (pullRequests.length === 0) {
-      core.info(`No open pull requests found for workflow run ${workflowRun.id}.`)
-      return
-    }
-
-    await this.automergePullRequests(pullRequests)
   }
 }
